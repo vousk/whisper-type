@@ -47,7 +47,8 @@
 
 | Section | Description |
 |---------|-------------|
-| `ui` | Dashboard/toggle state such as `calm_mode` and `rec_overlay` |
+| `ui` | Dashboard/toggle state such as `calm_mode`, `rec_overlay`, `dashboard_history_entries`, and `preserve_dashboard_history` |
+| `logging` | History text persistence (`save_history`) and history file size limit (`max_file_size_mb`) |
 | `hotkeys` | Dictation shortcut |
 | `audio` | Recording sample rate, beep volume, and `silence_timeout_seconds` (auto-stop after sustained silence; `0` disables it) |
 | `model` | Faster Whisper model size, device, and compute type |
@@ -57,7 +58,7 @@
 When the app writes `calm_mode` or `rec_overlay`, it preserves the full config structure and writes readable indented JSON.
 
 ### Tray Icon Interaction
-- **Left click:** Opens dashboard popup (dark-themed, slide-up animation). Shows status (Ready/Recording/Loading), today's stats (dictations + minutes), last 8 dictations, and action buttons (Calm Mode, Restart, Quit). Closes automatically when recording starts. Toggle behavior: second click closes dashboard
+- **Left click:** Opens dashboard popup (dark-themed, slide-up animation). Shows status (Ready/Recording/Loading), today's stats (dictations + minutes), the configured number of previous dictations, and action buttons (Calm Mode, Restart, Quit). Closes automatically when recording starts. Toggle behavior: second click closes dashboard
 - **Right click:** Native context menu with Calm Mode toggle, Restart, Quit
 
 ### Tray Menu (Right Click)
@@ -86,7 +87,7 @@ HKCU\Software\Microsoft\Windows\CurrentVersion\Run\WhisperDiktiertool
 ```
 - **Value:** `"C:\...\pythonw.exe" "C:\...\whisper-dictate.py"` (dynamic paths)
 - **No PowerShell/COM needed:** uses `winreg` (Python stdlib)
-- **Self-provisioning:** `ensure_autostart()` checks startup if registry entry is correct and sets it if needed (independent of install.bat)
+- **Setup-managed:** `install.bat` creates or removes the Registry Run key according to the user's autostart choice; the runtime app does not change autostart settings.
 - **Cleanup:** old `.lnk` from Startup folder and `StartupApproved` ghost entry are removed automatically
 
 ### Start Manually
@@ -238,11 +239,10 @@ Run `uninstall.bat` from the project folder.
 
 What it does:
 1. Removes the `WhisperDiktiertool` Run key from HKCU (if present)
-2. Removes old Startup `.lnk` and `StartupApproved` ghost entry
-3. Asks whether to keep local data files (logs/config/history)
-4. Asks whether to keep downloaded Whisper model cache
-5. Removes project-local `.venv` and Python `__pycache__` folders
-6. Optionally removes desktop `Whisper Restart.lnk`
+2. Asks whether to keep local data files (logs/config/history)
+3. Asks whether to keep downloaded Whisper model cache
+4. Removes project-local `.venv` and Python `__pycache__` folders
+5. Optionally removes desktop `Whisper Restart.lnk`
 
 ---
 
