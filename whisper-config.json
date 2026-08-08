@@ -1,13 +1,13 @@
 {
     "ui": {
         "calm_mode": false,
-        "rec_overlay": true,
+        "rec_overlay": false,
         "dashboard_history_entries": 8,
-        "preserve_dashboard_history": true
+        "preserve_dashboard_history": false
     },
     "logging": {
         "save_history": true,
-        "max_file_size_mb": 10
+        "max_file_size_mb": 3
     },
     "hotkeys": {
         "dictation": "ctrl+²"
@@ -27,7 +27,7 @@
         "beam_size": 3,
         "vad_filter": true,
         "condition_on_previous_text": false,
-        "initial_prompt": "Cette dictée est en français. Les termes utilisés peuvent être PongFlow, Ping, FFTT, SPIDD v2, Vousk-prod., Vousk.",
+        "initial_prompt": "Cette dictée est en français. Certains termes utilisés peuvent être Vousk-prod., Vousk, PongFlow, Ping, FFTT, SPIDD v2.",
         "no_speech_threshold": null,
         "debug_transcription": false,
         "short_text_max_words": 3
@@ -49,7 +49,6 @@
             "\\bvouskprod\\b": "Vousk-prod."
         },
         "hallucination_phrases": [
-            "thank you for watching"
         ]
     }
 }
