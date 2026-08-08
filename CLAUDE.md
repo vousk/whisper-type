@@ -26,14 +26,16 @@
 
 | Shortcut | Function |
 |----------|----------|
-| `CTRL+ALT+D` | Start/stop recording |
+| `CTRL+ALT+D` | Start/stop dictation (manual or continuous, based on config) |
 | `CTRL+ALT+W` | Restart Whisper (kill + start) via desktop shortcut |
 
 ### How It Works
-- **Hotkey:** `CTRL+ALT+D` starts/stops recording (configured via `hotkeys.dictation` in `whisper-config.json`)
+- **Hotkey:** `CTRL+ALT+D` starts/stops dictation (configured via `hotkeys.dictation` in `whisper-config.json`), behavior controlled by `dictation_mode`
 - **Model:** `faster-whisper` large-v3-turbo, language: German by default (configured via `model.*` and `transcription.dictation_language` in `whisper-config.json`)
 - **GPU:** CUDA int8_float16 on RTX 4060 (~3 GB VRAM)
 - **Transcription:** `beam_size=3`, `vad_filter=True`, `condition_on_previous_text=False` by default, audio is passed directly to Whisper as a NumPy array (no WAV roundtrip). All transcription options live under `transcription` in `whisper-config.json`
+- **Dictation modes:** `dictation_mode="manual"` keeps classic press-start/press-stop behavior; `dictation_mode="continuous"` keeps microphone open until second hotkey press, shows preview popup updates, then retranscribes full session audio for one final paste
+- **Continuous preview text:** preview popup lines show raw Whisper text (no spoken punctuation replacement, no word correction, no trailing-period cleanup)
 - **Initial prompt:** Domain terms Whisper should recognize correctly (e.g. CLAUDE.md). Configurable via `transcription.initial_prompt`, no performance impact
 - **Spoken punctuation:** Spoken punctuation is automatically replaced (e.g. "Doppelpunkt" -> `:`, "Fragezeichen" -> `?`, "Anfuehrungszeichen" -> `"`) when `post_processing.apply_spoken_punctuation` is enabled. Mappings are configurable in `post_processing.spoken_punctuation`
 - **Output:** Transcribed text is inserted into the active window via clipboard
@@ -49,10 +51,24 @@
 |---------|-------------|
 | `ui` | Dashboard/toggle state such as `calm_mode` and `rec_overlay` |
 | `hotkeys` | Dictation shortcut |
+| `dictation_mode` | Selects dictation behavior: `manual` or `continuous` |
+| `continuous` | Continuous-mode segmentation and preview popup settings |
 | `audio` | Recording sample rate |
 | `model` | Faster Whisper model size, device, and compute type |
 | `transcription` | Language, beam size, VAD, initial prompt, debug logging, short-text punctuation behavior |
 | `post_processing` | Spoken punctuation toggle/regexes, word corrections, and hallucination phrase filters |
+
+### Continuous Settings (`whisper-config.json`)
+
+| Key | Purpose |
+|-----|---------|
+| `continuous.silence_duration` | Silence duration (seconds) required to close a preview segment |
+| `continuous.min_speech_duration` | Minimum speech duration (seconds) before emitting a preview |
+| `continuous.max_preview_segment_duration` | Max preview segment duration (seconds) before forced split |
+| `continuous.preroll_duration` | Pre-speech buffered audio kept to avoid cutting initial phonemes |
+| `continuous.rms_threshold` | RMS threshold for speech activity detection |
+| `continuous.min_speech_blocks` | Consecutive speaking blocks required before segment start |
+| `continuous.preview_opacity` | Preview popup opacity from `0.0` to `1.0` |
 
 When the app writes `calm_mode` or `rec_overlay`, it preserves the full config structure and writes readable indented JSON.
 
@@ -171,7 +187,7 @@ Python312/Lib/site-packages/nvidia/cudnn/bin
 | `float16` compute_type | Maximum quality on RTX 4060 |
 | `beam_size=5` | Best results, slightly slower than beam_size=3 |
 | `condition_on_previous_text=False` | Lower context overhead |
-| Preview feature removed entirely | No GPU contention, no 0-3s wait for preview thread stop |
+| Continuous preview worker with serialized Whisper access | Keeps preview responsive while preventing concurrent transcribe calls |
 | Mic icon 8x supersampling (instead of 4x) | Smoother edges despite tkinter 1-bit transparency |
 | Composite edges against dark red (instead of black) | Semi-transparent edge pixels become dark red instead of near-black |
 | Convert segment generator to list (`list(segments)`) | Prevents data loss on iteration errors |

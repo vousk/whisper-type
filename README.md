@@ -91,6 +91,17 @@ Notes:
 
 Left-click the tray icon to open the dashboard with stats, history, and actions. Right-click for the context menu.
 
+### Dictation Modes
+
+The hotkey `CTRL+ALT+D` uses the mode selected in `whisper-config.json`:
+
+- **`dictation_mode: "manual"`**
+   First press starts recording, second press stops recording, then one final transcription is pasted.
+- **`dictation_mode: "continuous"`**
+   First press starts a continuous session with live preview popup updates. Second press stops capture, retranscribes the full in-memory session audio once, and pastes a single final text.
+
+In continuous mode, preview lines are shown as raw Whisper output (no post-processing). Only the final pasted text uses the normal post-processing pipeline.
+
 ### Tip: Mouse shortcut
 
 With Razer Synapse (or similar software) you can map `CTRL+ALT+D` to a mouse button, e.g. Hypershift + scroll wheel click. Dictate without touching the keyboard.
@@ -117,7 +128,15 @@ All user-editable settings live in `whisper-config.json`. The file is structured
 |---------|-------------|---------|
 | `hotkeys.dictation` | Start/stop recording hotkey | `ctrl+alt+d` |
 | `audio.sample_rate` | Microphone sample rate for Whisper | `16000` |
-| `audio.beep_volume` | Audio feedback volume, from silent `0.0` to max `1.0` | `0.2` |
+| `audio.beep_volume` | Audio feedback volume, from silent `0.0` to max `1.0` | `0.1` |
+| `dictation_mode` | Dictation behavior: manual press-to-talk or continuous session | `continuous` |
+| `continuous.silence_duration` | Silence required to close a preview segment (seconds) | `0.3` |
+| `continuous.min_speech_duration` | Minimum speech duration before a preview can be emitted (seconds) | `0.25` |
+| `continuous.max_preview_segment_duration` | Force a preview update for very long speech without pause (seconds) | `30.0` |
+| `continuous.preroll_duration` | Audio pre-roll kept before speech detection to avoid cutting first phonemes (seconds) | `0.5` |
+| `continuous.rms_threshold` | RMS speech detection threshold for continuous segmentation | `0.003` |
+| `continuous.min_speech_blocks` | Consecutive speech blocks required before starting a preview segment | `3` |
+| `continuous.preview_opacity` | Continuous preview popup opacity (`0.0` to `1.0`) | `0.60` |
 | `model.size` | Whisper model | `large-v3-turbo` |
 | `model.device` | Faster Whisper device | `cuda` |
 | `model.compute_type` | Faster Whisper compute type | `int8_float16` |
@@ -153,11 +172,11 @@ If you prefer faster transcriptions over maximum accuracy, switch to `large-v3-t
 
 ## How It Works
 
-1. **Hotkey** triggers audio recording via `sounddevice`
-2. **Audio** is captured as a NumPy array at 16kHz (no WAV file intermediary)
+1. **Hotkey** triggers recording start/stop behavior based on `dictation_mode`
+2. **Audio** is captured as NumPy chunks at 16kHz (no WAV file intermediary)
 3. **Whisper** transcribes with `faster-whisper` (CTranslate2 backend) on your GPU
-4. **Post-processing** applies spoken punctuation replacement and hallucination filtering
-5. **Output** is pasted into the active window via clipboard
+4. **Continuous mode only:** short preview segments are detected from speech/silence and shown in a popup
+5. **Final output** is pasted once into the active window via clipboard, after standard post-processing
 
 The recording overlay uses pre-rendered animation frames (90 frames, 30fps) with 2D pixel displacement simulating SVG feDisplacementMap. A dual-ring system (inner plasma ring + outer orbit ring) with independent noise fields creates the electric border effect. All blur layers are pre-composited before the frame loop for minimal CPU usage during recording.
 

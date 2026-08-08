@@ -41,6 +41,8 @@ import math
 import re
 import json
 import threading
+import queue
+from collections import deque
 import numpy as np
 import sounddevice as sd
 import keyboard
@@ -69,10 +71,29 @@ model = None
 stream = None
 target_window = None
 tray_icon = None
+dictation_overlay = None
 calm_mode = False  # True = static mic icon instead of Electric Border
 rec_overlay = True  # True = show red recording overlay while recording
 ui_error_message = None
 _dashboard_toggle = threading.Event()  # Signal from tray (left click) to tkinter thread
+
+# Continuous dictation keeps the complete session in RAM while short preview
+# segments are sent to one serialized Whisper worker.
+audio_lock = threading.Lock()
+transcription_lock = threading.Lock()
+preview_queue = queue.Queue()
+preview_worker_started = False
+continuous_session_id = 0
+continuous_active = False
+continuous_finalizing = False
+session_audio_chunks = []
+preview_audio_chunks = []
+preview_preroll_chunks = deque()
+preview_preroll_seconds = 0.0
+preview_segment_seconds = 0.0
+preview_speech_seconds = 0.0
+preview_silence_seconds = 0.0
+preview_speech_blocks = 0
 
 
 def create_icon_idle():
@@ -295,7 +316,7 @@ def remove_trailing_period(text):
     return text
 
 
-def append_to_history(text, duration=0):
+def append_to_history(text, duration=0.0):
     """Save transcription with timestamp and duration in whisper-history.log."""
     try:
         from datetime import datetime
@@ -356,6 +377,13 @@ def _validate_config(config):
         ("transcription", "no_speech_threshold"),
         ("transcription", "debug_transcription"),
         ("transcription", "short_text_max_words"),
+        ("continuous", "silence_duration"),
+        ("continuous", "min_speech_duration"),
+        ("continuous", "max_preview_segment_duration"),
+        ("continuous", "preroll_duration"),
+        ("continuous", "rms_threshold"),
+        ("continuous", "min_speech_blocks"),
+        ("continuous", "preview_opacity"),
         ("post_processing", "apply_spoken_punctuation"),
         ("post_processing", "spoken_punctuation"),
         ("post_processing", "word_corrections"),
@@ -364,9 +392,16 @@ def _validate_config(config):
     for section, key in required_values:
         _require_config_value(config, section, key)
 
+    if "dictation_mode" not in config:
+        raise RuntimeError("Missing config value: dictation_mode")
+
     beep_volume = float(config["audio"]["beep_volume"])
     if not 0 <= beep_volume <= 1:
         raise RuntimeError("Config value audio.beep_volume must be between 0.0 and 1.0")
+    if config["dictation_mode"] not in ("manual", "continuous"):
+        raise RuntimeError("Config value dictation_mode must be 'manual' or 'continuous'")
+    if not 0 < float(config["continuous"]["preview_opacity"]) <= 1:
+        raise RuntimeError("Config value continuous.preview_opacity must be between 0 and 1")
 
 
 def load_config():
@@ -1267,6 +1302,78 @@ class RecordingOverlay:
         if tray_icon:
             on_quit(tray_icon, None)
 
+    # ================================================================
+    # Continuous dictation preview popup
+    # ================================================================
+
+    def show_preview_popup(self):
+        """Create the non-focusable popup used only by continuous dictation."""
+        import tkinter as tk
+
+        if getattr(self, "_preview_win", None):
+            return
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.attributes("-alpha", float(CONFIG["continuous"]["preview_opacity"]))
+        win.configure(bg="#141421")
+        win.protocol("WM_DELETE_WINDOW", self.close_preview_popup)
+
+        frame = tk.Frame(win, bg="#141421", padx=12, pady=10)
+        frame.pack(fill="both", expand=True)
+        self._preview_status = tk.Label(frame, text="Listening", font=("Segoe UI Semibold", 9),
+                                        fg="#22c55e", bg="#141421", anchor="w")
+        self._preview_status.pack(fill="x", pady=(0, 6))
+        self._preview_text = tk.Text(frame, width=44, height=6, wrap="word", state="disabled",
+                                     font=("Segoe UI", 10), fg="#eaeaf2", bg="#141421",
+                                     bd=0, highlightthickness=0)
+        self._preview_text.pack(fill="both", expand=True)
+
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        win.geometry(f"360x150+{screen_w - 376}+{screen_h - 230}")
+        self._preview_win = win
+
+    def close_preview_popup(self):
+        """Close the popup without affecting the recording session."""
+        win = getattr(self, "_preview_win", None)
+        if win:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+        self._preview_win = None
+        self._preview_text = None
+        self._preview_status = None
+
+    def set_preview_status(self, status):
+        if getattr(self, "_preview_win", None) and self._preview_status:
+            self._preview_status.configure(text=status)
+
+    def append_preview_text(self, text):
+        if not getattr(self, "_preview_win", None) or not self._preview_text or not text:
+            return
+        self._preview_text.configure(state="normal")
+        self._preview_text.insert("end", text.strip() + "\n")
+        self._preview_text.see("end")
+        self._preview_text.configure(state="disabled")
+        self.set_preview_status("Listening")
+
+    def schedule_preview(self, action, value=None):
+        """Marshal preview UI work onto Tk's owning thread."""
+        if self.root:
+            try:
+                if action == "show":
+                    self.root.after(0, self.show_preview_popup)
+                elif action == "close":
+                    self.root.after(0, self.close_preview_popup)
+                elif action == "status":
+                    self.root.after(0, self.set_preview_status, value)
+                elif action == "text":
+                    self.root.after(0, self.append_preview_text, value)
+            except Exception:
+                pass
+
 
 def load_model():
     """Load Whisper model at startup."""
@@ -1301,14 +1408,192 @@ def audio_callback(indata, frames, time_info, status):
         # Input overflow = audio data was lost (buffer too small)
         audio_overflow_count += 1
     if recording:
-        audio_chunks.append(indata.copy())
+        chunk = indata.copy()
         # Compute RMS level for orb animation (0.0-1.0)
-        audio_level = min(1.0, np.sqrt(np.mean(indata**2)) * 5.0)
+        audio_level = min(1.0, np.sqrt(np.mean(chunk**2)) * 5.0)
+        if continuous_active:
+            _capture_continuous_chunk(chunk)
+        else:
+            audio_chunks.append(chunk)
+
+
+def dictation_mode():
+    return str(CONFIG["dictation_mode"])
+
+
+def _drain_preview_queue():
+    """Discard queued preview audio; an in-progress Whisper call is allowed to finish."""
+    while True:
+        try:
+            preview_queue.get_nowait()
+        except queue.Empty:
+            return
+
+
+def _reset_continuous_buffers():
+    """Release every audio reference owned by the current continuous session."""
+    global preview_preroll_seconds, preview_segment_seconds, preview_speech_seconds
+    global preview_silence_seconds, preview_speech_blocks
+    session_audio_chunks.clear()
+    preview_audio_chunks.clear()
+    preview_preroll_chunks.clear()
+    preview_preroll_seconds = 0.0
+    preview_segment_seconds = 0.0
+    preview_speech_seconds = 0.0
+    preview_silence_seconds = 0.0
+    preview_speech_blocks = 0
+
+
+def _queue_preview_segment_locked():
+    """Detach the current preview segment while the callback immediately continues."""
+    global preview_audio_chunks, preview_segment_seconds, preview_speech_seconds
+    global preview_silence_seconds, preview_speech_blocks
+    if not preview_audio_chunks:
+        return
+    if preview_speech_seconds < float(CONFIG["continuous"]["min_speech_duration"]):
+        preview_audio_chunks.clear()
+        preview_segment_seconds = 0.0
+        preview_speech_seconds = 0.0
+        preview_silence_seconds = 0.0
+        preview_speech_blocks = 0
+        return
+    segment = preview_audio_chunks
+    session_id = continuous_session_id
+    preview_audio_chunks = []
+    preview_segment_seconds = 0.0
+    preview_speech_seconds = 0.0
+    preview_silence_seconds = 0.0
+    preview_speech_blocks = 0
+    try:
+        preview_queue.put_nowait((session_id, segment))
+    except Exception:
+        segment.clear()
+
+
+def _capture_continuous_chunk(chunk):
+    """Run bounded RMS segmentation in the sound callback without invoking Whisper."""
+    global preview_preroll_seconds, preview_audio_chunks, preview_segment_seconds
+    global preview_speech_seconds, preview_silence_seconds, preview_speech_blocks
+    chunk_seconds = len(chunk) / float(CONFIG["audio"]["sample_rate"])
+    rms = float(np.sqrt(np.mean(chunk ** 2)))
+    is_speech = rms >= float(CONFIG["continuous"]["rms_threshold"])
+    with audio_lock:
+        if not continuous_active or continuous_finalizing:
+            return
+        session_audio_chunks.append(chunk)
+        if not preview_audio_chunks:
+            preview_preroll_chunks.append(chunk)
+            preview_preroll_seconds += chunk_seconds
+            while preview_preroll_seconds > float(CONFIG["continuous"]["preroll_duration"]):
+                preview_preroll_seconds -= len(preview_preroll_chunks.popleft()) / float(CONFIG["audio"]["sample_rate"])
+            preview_speech_blocks = preview_speech_blocks + 1 if is_speech else 0
+            if preview_speech_blocks < int(CONFIG["continuous"]["min_speech_blocks"]):
+                return
+            preview_audio_chunks = list(preview_preroll_chunks)
+            preview_preroll_chunks.clear()
+            preview_preroll_seconds = 0.0
+            preview_segment_seconds = sum(len(part) for part in preview_audio_chunks) / float(CONFIG["audio"]["sample_rate"])
+            preview_speech_seconds = preview_speech_blocks * chunk_seconds
+            preview_silence_seconds = 0.0
+            return
+
+        preview_audio_chunks.append(chunk)
+        preview_segment_seconds += chunk_seconds
+        if is_speech:
+            preview_speech_seconds += chunk_seconds
+            preview_silence_seconds = 0.0
+        else:
+            preview_silence_seconds += chunk_seconds
+        if (preview_silence_seconds >= float(CONFIG["continuous"]["silence_duration"]) or
+                preview_segment_seconds >= float(CONFIG["continuous"]["max_preview_segment_duration"])):
+            _queue_preview_segment_locked()
+
+
+def _transcribe_audio(audio, filter_hallucinations_enabled=True):
+    """Use the shared Faster-Whisper configuration for preview and final audio."""
+    if model is None:
+        raise RuntimeError("Whisper model is not ready")
+    transcription_config = CONFIG["transcription"]
+    segments, _info = model.transcribe(
+        audio,
+        language=transcription_config["dictation_language"],
+        beam_size=int(transcription_config["beam_size"]),
+        vad_filter=bool(transcription_config["vad_filter"]),
+        condition_on_previous_text=bool(transcription_config["condition_on_previous_text"]),
+        initial_prompt=str(transcription_config["initial_prompt"]),
+    )
+    segment_list = list(segments)
+    if filter_hallucinations_enabled:
+        return " ".join(filter_hallucinations(segment_list)).strip()
+    return " ".join(segment.text.strip() for segment in segment_list if segment.text.strip()).strip()
+
+
+def _post_process_final_text(text):
+    if bool(CONFIG["post_processing"]["apply_spoken_punctuation"]):
+        text = apply_spoken_punctuation(text)
+    return remove_trailing_period(apply_word_corrections(text))
+
+
+def _paste_final_text(text):
+    if target_window:
+        user32.SetForegroundWindow(target_window)
+        time.sleep(0.1)
+    old_clipboard = ""
+    try:
+        old_clipboard = pyperclip.paste()
+    except Exception:
+        pass
+    pyperclip.copy(text)
+    time.sleep(0.05)
+    keyboard.send("ctrl+v")
+    time.sleep(0.15)
+    try:
+        pyperclip.copy(old_clipboard)
+    except Exception:
+        pass
+
+
+def _preview_worker():
+    """Serialize preview calls so Faster-Whisper is never used concurrently."""
+    while True:
+        session_id, segment_chunks = preview_queue.get()
+        try:
+            with audio_lock:
+                valid = continuous_active and not continuous_finalizing and session_id == continuous_session_id
+            if not valid:
+                continue
+            if dictation_overlay:
+                dictation_overlay.schedule_preview("status", "Transcribing...")
+            audio = np.concatenate(segment_chunks, axis=0).flatten()
+            segment_chunks.clear()
+            with transcription_lock:
+                with audio_lock:
+                    valid = continuous_active and not continuous_finalizing and session_id == continuous_session_id
+                text = _transcribe_audio(audio, filter_hallucinations_enabled=False) if valid else ""
+            del audio
+            if text and dictation_overlay:
+                dictation_overlay.schedule_preview("text", text)
+        except Exception as exc:
+            append_to_history(f"[DEBUG] Continuous preview failed: {exc}")
+            if dictation_overlay:
+                dictation_overlay.schedule_preview("status", "Listening")
+        finally:
+            segment_chunks.clear()
+
+
+def _ensure_preview_worker():
+    global preview_worker_started
+    if not preview_worker_started:
+        threading.Thread(target=_preview_worker, daemon=True).start()
+        preview_worker_started = True
 
 
 def start_recording():
     """Start recording."""
     global recording, audio_chunks, audio_overflow_count, stream, target_window
+    if dictation_mode() == "continuous":
+        start_continuous_recording()
+        return
     if recording:
         return
 
@@ -1333,9 +1618,53 @@ def start_recording():
     update_tray("Recording...", create_icon_recording())
 
 
+def start_continuous_recording():
+    """Start a continuous session and keep its only complete audio copy in RAM."""
+    global recording, audio_overflow_count, stream, target_window, continuous_active
+    global continuous_finalizing, continuous_session_id
+    if recording:
+        return
+
+    target_window = user32.GetForegroundWindow()
+    play_start_sound()
+    with audio_lock:
+        _reset_continuous_buffers()
+        continuous_session_id += 1
+        continuous_active = True
+        continuous_finalizing = False
+    _drain_preview_queue()
+    _ensure_preview_worker()
+
+    audio_overflow_count = 0
+    recording = True
+    try:
+        stream = sd.InputStream(
+            samplerate=int(CONFIG["audio"]["sample_rate"]),
+            channels=1,
+            dtype="float32",
+            callback=audio_callback,
+            blocksize=1024,
+            latency="high",
+        )
+        stream.start()
+    except Exception:
+        recording = False
+        with audio_lock:
+            continuous_active = False
+            _reset_continuous_buffers()
+        raise
+
+    if dictation_overlay:
+        dictation_overlay.schedule_preview("show")
+    update_tray("Recording...", create_icon_recording())
+
+
 def stop_recording_and_transcribe():
     """Stop recording, transcribe, and insert text."""
     global recording, stream, audio_level
+    if dictation_mode() == "continuous":
+        stop_continuous_recording_and_transcribe()
+        return
     if not recording:
         return
 
@@ -1377,27 +1706,11 @@ def stop_recording_and_transcribe():
         return
 
     try:
-        transcription_config = CONFIG["transcription"]
         t_start = time.time()
-        segments, info = model.transcribe(
-            audio,
-            language=transcription_config["dictation_language"],
-            beam_size=int(transcription_config["beam_size"]),
-            vad_filter=bool(transcription_config["vad_filter"]),
-            condition_on_previous_text=bool(transcription_config["condition_on_previous_text"]),
-            initial_prompt=str(transcription_config["initial_prompt"]),
-        )
-
-        # Fully consume generator (prevents data loss on iteration errors)
-        segments_list = list(segments)
+        with transcription_lock:
+            text = _transcribe_audio(audio)
         t_transcribe = time.time() - t_start
-
-        parts = filter_hallucinations(segments_list)
-        text = " ".join(parts).strip()
-        if bool(CONFIG["post_processing"]["apply_spoken_punctuation"]):
-            text = apply_spoken_punctuation(text)
-        text = apply_word_corrections(text)
-        text = remove_trailing_period(text)
+        text = _post_process_final_text(text)
 
         # Performance log
         ratio = duration / t_transcribe if t_transcribe > 0 else 0
@@ -1412,32 +1725,101 @@ def stop_recording_and_transcribe():
             )
 
         if text:
-            if target_window:
-                user32.SetForegroundWindow(target_window)
-                time.sleep(0.1)
-
-            old_clipboard = ""
-            try:
-                old_clipboard = pyperclip.paste()
-            except Exception:
-                pass
-
-            pyperclip.copy(text)
-            time.sleep(0.05)
-            keyboard.send("ctrl+v")
-
-            time.sleep(0.15)
-            try:
-                pyperclip.copy(old_clipboard)
-            except Exception:
-                pass
-
+            _paste_final_text(text)
             append_to_history(text, duration)
 
     except Exception as e:
         append_to_history(f"[ERROR] Transcription failed: {e}")
+    finally:
+        audio_chunks.clear()
+        del audio
 
     update_tray(f"Ready ({hotkey_display_text()})", create_icon_idle())
+
+
+def stop_continuous_recording_and_transcribe():
+    """Freeze a continuous session, abandon previews, then transcribe it once."""
+    global recording, stream, audio_level, continuous_active, continuous_finalizing
+    global session_audio_chunks
+    if not recording:
+        return
+
+    recording = False
+    audio_level = 0.0
+    if stream:
+        try:
+            stream.stop()
+            stream.close()
+        finally:
+            stream = None
+    play_stop_sound()
+
+    with audio_lock:
+        continuous_finalizing = True
+        continuous_active = False
+        full_chunks = session_audio_chunks
+        session_audio_chunks = []
+    _drain_preview_queue()
+    if dictation_overlay:
+        dictation_overlay.schedule_preview("status", "Finalizing...")
+    update_tray("Transcribing...", create_icon_loading())
+
+    audio = None
+    try:
+        if not full_chunks:
+            return
+        audio = np.concatenate(full_chunks, axis=0).flatten()
+        duration = len(audio) / int(CONFIG["audio"]["sample_rate"])
+        if duration < 0.3:
+            return
+        t_start = time.time()
+        # This waits only for a preview already inside Whisper; queued previews were discarded.
+        with transcription_lock:
+            text = _transcribe_audio(audio)
+        t_transcribe = time.time() - t_start
+        text = _post_process_final_text(text)
+        ratio = duration / t_transcribe if t_transcribe > 0 else 0
+        append_to_history(f"[PERF] {duration:.1f}s audio -> {t_transcribe:.1f}s transcription ({ratio:.1f}x real-time)")
+        if text:
+            _paste_final_text(text)
+            append_to_history(text, duration)
+    except Exception as exc:
+        append_to_history(f"[ERROR] Continuous transcription failed: {exc}")
+    finally:
+        full_chunks.clear()
+        if audio is not None:
+            del audio
+        _drain_preview_queue()
+        with audio_lock:
+            _reset_continuous_buffers()
+            continuous_finalizing = False
+        if dictation_overlay:
+            dictation_overlay.schedule_preview("close")
+        update_tray(f"Ready ({hotkey_display_text()})", create_icon_idle())
+
+
+def cleanup_recording_for_exit():
+    """Stop capture and discard audio without transcribing during quit or restart."""
+    global recording, stream, audio_level, continuous_active, continuous_finalizing
+    global continuous_session_id
+    recording = False
+    audio_level = 0.0
+    if stream:
+        try:
+            stream.stop()
+            stream.close()
+        except Exception:
+            pass
+        stream = None
+    with audio_lock:
+        continuous_active = False
+        continuous_finalizing = True
+        continuous_session_id += 1
+        _reset_continuous_buffers()
+    audio_chunks.clear()
+    _drain_preview_queue()
+    if dictation_overlay:
+        dictation_overlay.schedule_preview("close")
 
 
 def hotkey_loop():
@@ -1463,6 +1845,7 @@ def on_restart(icon, item):
     Uses pythonw (not cmd.exe) for delayed start,
     so no terminal window is visible.
     """
+    cleanup_recording_for_exit()
     script_dir = os.path.dirname(os.path.abspath(__file__))
     script_path = os.path.join(script_dir, "whisper-dictate.py")
     pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
@@ -1501,12 +1884,13 @@ def on_activate(icon, item):
 
 def on_quit(icon, item):
     """Quit via tray menu."""
+    cleanup_recording_for_exit()
     icon.stop()
     os._exit(0)
 
 
 def main():
-    global tray_icon, ui_error_message
+    global tray_icon, ui_error_message, dictation_overlay
 
     # Do not force-enable autostart at runtime.
     # Keep only cleanup of legacy Startup shortcut artifacts.
@@ -1574,6 +1958,7 @@ def main():
     # Recording overlay (floating "REC" indicator)
     if ui_available:
         overlay = RecordingOverlay()
+        dictation_overlay = overlay
         overlay.start()
 
     # Run hotkey loop and model loading in background threads

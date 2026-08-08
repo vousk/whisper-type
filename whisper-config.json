@@ -10,6 +10,16 @@
         "sample_rate": 16000,
         "beep_volume": 0.1
     },
+    "dictation_mode": "continuous",
+    "continuous": {
+        "silence_duration": 0.65,
+        "min_speech_duration": 0.25,
+        "max_preview_segment_duration": 4.0,
+        "preroll_duration": 0.5,
+        "rms_threshold": 0.003,
+        "min_speech_blocks": 3,
+        "preview_opacity": 0.60
+    },
     "model": {
         "size": "large-v3-turbo",
         "device": "cuda",
