@@ -15,7 +15,7 @@
     "audio": {
         "sample_rate": 16000,
         "beep_volume": 0.05,
-        "silence_timeout_seconds": 5
+        "silence_timeout_seconds": 10
     },
     "model": {
         "size": "large-v3-turbo",
@@ -27,7 +27,7 @@
         "beam_size": 3,
         "vad_filter": true,
         "condition_on_previous_text": false,
-        "initial_prompt": "Cette dictée est en français. Certains termes utilisés peuvent être Vousk-prod., Vousk, PongFlow, Ping, FFTT, SPIDD v2.",
+        "initial_prompt": "Cette dictée est en français. Certains termes utilisés peuvent être Vousk-prod., Vousk, PongFlow, Ping, FFTT, SPIDD v2, Girpe-v2, BMad, JA",
         "no_speech_threshold": null,
         "debug_transcription": false,
         "short_text_max_words": 3
@@ -46,9 +46,10 @@
         },
         "word_corrections": {
             "\\b(?:W|V)(?:u|o|oo|ou|uo)s(?:k|c)\\b": "Vousk",
-            "\\bvouskprod\\b": "Vousk-prod."
+            "\\bvouskprod\\b": "Vousk-prod.",
+            "\\bJIA\\b": "JA",
+            "\\bSPID\\b": "SPIDD"
         },
-        "hallucination_phrases": [
-        ]
+        "hallucination_phrases": []
     }
 }
